@@ -11,9 +11,11 @@ local setmetatable = setmetatable
 local string = string
 local getmetatable = getmetatable
 local os = os
+local pcall = pcall
+local tostring = tostring
 
-local print = print
-local t2spp = t2spp
+--local print = print
+--local t2spp = t2spp
 
 -- Create the module table here
 local M = {}
@@ -225,11 +227,11 @@ end
 
 local function request(self, url, payload, headers, verb, options)
 	local content, code = self.oauth2:request(url, payload, headers, verb, options)
-	if code ~= 200 then 
+	if code < 200 or code > 206 then 
 		--print(content)
 		return nil,formatHttpCodeError(code)
 	end
-	return json.decode(content)
+	return json.decode(content) or ""
 end
 
 -- Returns the parsed URL in a table
@@ -241,20 +243,55 @@ local function buildUrl(self, params, endpoint)
 	return result
 end
 
+-- Function to get information for a file given the fileId
 local function get(self,params, fileId)
 	local url = buildUrl(self,params, self.config.endpoint .. 'files/' .. fileId)
 	return request(self,url)
 end
 
-local function list(self,params,endpoint)
+-- Function to get data from an endpoint
+local function list(self, params, endpoint)
 	local url = buildUrl(self,params,endpoint)		-- Returns the parsed URL in a table
 	return request(self,url)
+end
+
+-- Function to send a body to an endpoint
+-- verb is the http method like "GET", "POST", "PUT". Since there is a body the default verb is "POST"
+local function insert(self, params, body, endpoint, verb)
+	local url = buildUrl(self,params,endpoint)		-- Returns the parsed URL in a table
+	return request(self, url, json.encode(body), {'Content-Type: application/json'}, verb)
 end
 
 local objMeta, createObject
 
 do
 	local nextListPage
+	local function generateBoundary()
+		math.randomseed(os.time())
+		local rnd = function() return string.sub(math.random(), 3) end
+		local result = {}
+		for i = 1,5 do table.insert(result, rnd()) end
+		return table.concat(result)
+	end
+
+	local function buildMultipartRelated(parts)
+		local boundary = generateBoundary()
+		local result = {}
+		for _,part in pairs(parts) do
+			-- delimiter
+			table.insert(result, '--' .. boundary)
+			-- encapsulation
+			table.insert(result, '\r\n')
+			table.insert(result, 'Content-Type: ' .. part.type .. '\r\n')
+			table.insert(result, '\r\n')
+			table.insert(result, part.data)
+			table.insert(result, '\r\n')
+		end
+		-- close-delimiter
+		table.insert(result, '--' .. boundary .. '--' .. '\r\n')
+		return table.concat(result), 'multipart/related; boundary=' .. boundary
+	end
+	
 	function nextListPage(dirList)
 		if not dirList.nextPageToken or not dirList.items or not dirList.items[1] or not objData[dirList.items[1]] or not dirList.parentID then
 			return nil
@@ -296,13 +333,14 @@ do
 			end,
 			setProperty = function(t,prop,val)
 				if not objData[t] then
-					return
+					return nil, "Invalid item object"
 				end
 				local self = objData[t].gdrive
-				local body = {[prop] = val}
-				local url = buildUrl(self,{},self.config.endpoint.."files/"..objData[t].id)		-- Returns the parsed URL in a table
-				local resp,msg = request(self, url, json.encode(body),{'Content-Type: application/json'},"PUT")		
+				local resp,msg = insert(self,{},{[prop] = val},self.config.endpoint.."files/"..objData[t].id,"PUT")
 				if resp then
+					if objData[t][prop] then
+						objData[t][prop] = val
+					end
 					return true
 				else
 					return nil,msg
@@ -310,7 +348,7 @@ do
 			end,
 			list = function(t,num)	-- num is number of results in the page
 				if not objData[t] or objData[t].mimeType ~= mimeType.folder or not objData[t].gdrive then
-					return nil
+					return nil,"Object not valid or not a folder"
 				end
 				num = num or 100
 				local self = objData[t].gdrive
@@ -331,23 +369,294 @@ do
 				end
 				return dirList
 			end,
-			mkdir = function(t,dirName)
+			-- function to check whether an item exists
+			-- name is the name of the item with the full path of the item from the root
+			-- typ is the type of item. Valid values are 'folder' or 'file'. Default is 'file'
+			-- Returns nil, Error message in case of error or failure
+			-- Returns item object if it exits
+			-- Returns false if it does not exist 
+			item = function(t,name,typ)
+				if not objData[t] or objData[t].mimeType ~= mimeType.folder then
+					return nil,"Object not valid or not a folder"
+				end
+				if not name or type(name) ~= "string" then
+					return nil, "Need a valid string directory name"
+				end
+				typ = typ or "file"
+				if type(typ) ~= "string" or (typ:lower() ~= "folder" and typ:lower() ~= "file") then
+					return nil,"Type argument should be either 'folder' or 'file'"
+				end
+				typ = typ:lower()
+				local self = objData[t].gdrive
+				local parentID = objData[t].id
+				local compareSign
+				if typ == "folder" then
+					compareSign = "="
+				else
+					compareSign = "!="
+				end
+				local stat,msg = list(self,{q="'"..parentID.."' in parents and title = '"..name.."' and mimeType "..compareSign.." '"..self.mimeType.folder.."'"})
+				if not stat then
+					return nil,"Cannot get directory listing: "..msg
+				end
+				if not stat.items[1] then
+					return false	-- No item found
+				end
+				return createObject(self,stat.items[1],objData[t].path..objData[t].title.."/")
 			end,
-			upload = function(t,source)
+			-- Function to create a directory with the given name, the function does not allow slashes in the name
+			mkdir = function(t,dirName)
+				if not objData[t] or objData[t].mimeType ~= mimeType.folder or not objData[t].gdrive then
+					return nil,"Object not valid or not a folder"
+				end
+				if not dirName or type(dirName) ~= "string" or dirName:find("/") or dirName:find([[\]]) then
+					return nil,"Invalid directory name"
+				end
+				local self = objData[t].gdrive
+				-- Check if it already exists
+				local folder = t:item(dirName,"folder")
+				if folder then
+					-- It already exists
+					return folder
+				end
+				local msg
+				-- Create the folder here
+				folder, msg = insert(self,{},{title = dirName, mimeType = self.mimeType.folder,parents={{id=objData[t].id}}})
+				if not folder then
+					return nil,"Could not create folder: "..msg
+				end
+				return createObject(self,folder,objData[t].path..objData[t].title..[[/]])
+			end,
+			-- Function to upload file to google drive. Right now only uploads using uploadType = multipart, have to work on making 
+			-- it automatically choose between multipart and resumable
+			-- title is the name of the file
+			-- source is a function which on each call returns the next chunk of data
+			-- It will not upload if the file already exists unless force is true
+			upload = function(t,title,source,force)
+				if not objData[t] or objData[t].mimeType ~= mimeType.folder or not objData[t].gdrive then
+					return nil,"Object not valid or not a folder"
+				end
+				if not source or type(source) ~= "function" then
+					return nil,"Need a data source function."
+				end
+				if not title or type(title) ~= "string" or title:find("/") or title:find([[/]]) then
+					return nil,"Invalid file name"
+				end
+				-- Check if it already exists
+				local file = t:item(title)
+				if file then
+					-- It already exists
+					if not force then
+						return nil, "File already exists."
+					else
+						-- Delete the file here
+						local resp,msg = file:delete()
+						if not resp then
+							return nil,"Unable to delete existing file: "..msg
+						end
+					end
+				end
+				
+				-- Upload the file here
+				local blobTab = {}
+				local stat,chunk = pcall(source)
+				if not stat then
+					return nil, "Error calling the data source function: "..chunk
+				end
+				while chunk do
+					blobTab[#blobTab + 1] = chunk
+					stat,chunk = pcall(source)
+					if not stat then
+						return nil, "Error calling the data source function: "..chunk
+					end
+				end
+				local blob = table.concat(blobTab)
+				local self = objData[t].gdrive				
+				local body = {title = title, mimeType = "text/plain", parents = {{id = objData[t].id}}}
+				local data = {
+					{data = json.encode(body), type = 'application/json'},
+					{data = blob, type = "text/plain"},
+				}
+				local content, contentType = buildMultipartRelated(data)
+				local url = buildUrl(self,{uploadType = 'multipart'}, self.config.endpoint_upload .. 'files')
+				local item,msg = request(self, url, content, {'Content-Type: ' .. contentType})
+				if not item then
+					return nil, "Error uploading file: "..msg
+				end
+				return createObject(self,item,objData[t].path..objData[t].title.."/")
 			end,
 			-- Function to move an item from current parents to the given parent object
-			move = function(t,dest)		
-				if not objData[dest] then
+			-- It will not move the item if a same name and type of item already exists at the destination unless force is true
+			move = function(t,dest,force)		
+				if not objData[dest] or objData[dest].mimeType ~= mimeType.folder then
 					return nil,"Invalid destination object."
 				end
+				if not objData[t] then
+					return nil, "Invalid item object"
+				end
+				local self = objData[t].gdrive
+				if objData[t].path == objData[dest].path..objData[dest].title.."/" then
+					return nil,"Source and destination paths the same."
+				end	
+				
+				-- Check if it already exists
+				local typ 
+				if objData[t].mimeType == mimeType.folder then
+					typ = "folder"
+				end
+				local item = dest:item(objData[t].title,typ)
+				if item then
+					-- It already exists
+					if not force then
+						return nil, "Similar item already exists at destination."
+					else
+						-- Delete the item here
+						local resp,msg = item:delete()
+						if not resp then
+							return nil,"Unable to delete existing item: "..msg
+						end
+					end
+				end
+				
+				-- Get the current parent id
+				local parents = t:getProperty("parents")
+				if not parents then
+					return nil,"Cannot retrieve the current parents for the item object"
+				end
+				local currParents = ""
+				for i = 1,#parents do
+					currParents = currParents..parents[i].id..","
+				end
+				-- Remove the last comma
+				currParents = currParents:sub(1,-2)
+				local resp,msg = insert(self,{addParents = objData[dest].id,removeParents = currParents},{},self.config.endpoint.."files/"..objData[t].id,"PUT")
+				if resp then
+					-- Change the path of the object here
+					objData[t].path = objData[dest].path..objData[dest].title.."/"
+					return true
+				else
+					return nil,msg
+				end
 			end,
-			rename = function(t,newName)
+			rename = function(t,newName,force)
+				if not objData[t] then
+					return nil, "Invalid item object"
+				end
+				if not newName or type(newName) ~= "string" or newName:find("/") or newName:find([[\]]) then
+					return nil,"Invalid directory name"
+				end
+				if newName == objData[t].title then	-- name is same as old name
+					return true
+				end
+				-- Check if it already exists
+				local typ 
+				if objData[t].mimeType == mimeType.folder then
+					typ = "folder"
+				end
+				local self = objData[t].gdrive
+				local item = self:item(objData[t].path..newName,typ)
+				if item then
+					-- It already exists
+					if not force then
+						return nil, "Item with the same name already exists."
+					else
+						-- Delete the item here
+						local resp,msg = item:delete()
+						if not resp then
+							return nil,"Unable to delete existing item: "..msg
+						end
+					end
+				end
+				return t:setProperty("title",newName)
 			end,
-			copyto = function(t,dest)
+			copyto = function(t,dest,force)
+				if not objData[dest] or objData[dest].mimeType ~= mimeType.folder then
+					return nil,"Invalid destination object."
+				end
+				if not objData[t] or objData[t].mimeType == mimeType.folder then
+					return nil, "Invalid item object or item a folder"
+				end
+				if objData[t].path == objData[dest].path..objData[dest].title.."/" then
+					return nil,"Source and destination paths the same."
+				end	
+				-- Check if it already exists
+				local typ 
+				if objData[t].mimeType == mimeType.folder then
+					typ = "folder"
+				end
+				local item = dest:item(objData[t].title,typ)
+				if item then
+					-- It already exists
+					if not force then
+						return nil, "Item with the same name already exists."
+					else
+						-- Delete the item here
+						local resp,msg = item:delete()
+						if not resp then
+							return nil,"Unable to delete existing item: "..msg
+						end
+					end
+				end
+				local self = objData[t].gdrive
+				local resp,msg = insert(self,{},{parents = {{id = objData[dest].id}}},self.config.endpoint.."files/"..objData[t].id.."/copy")
+				if resp then
+					return createObject(self,resp,objData[dest].path..objData[dest].title.."/")
+				else
+					return nil,"Error copying: "..msg
+				end
 			end,
 			delete = function(t)
+				if not objData[t] then
+					return nil, "Invalid item object"
+				end
+				local self = objData[t].gdrive
+				local url = buildUrl(self,{}, self.config.endpoint .. 'files/' .. objData[t].id)
+				local resp,msg = request(self,url,nil,nil,"DELETE")
+				if not resp then
+					return nil,"Error deleting: "..msg
+				end
+				return true
 			end,
-			download = function(t,sink)
+			-- Function to download a file or portion of it
+			download = function(t,sink,strt,stp)
+				if not objData[t] or objData[t].mimeType == mimeType.folder then
+					return nil, "Invalid item object"
+				end
+				if not sink or type(sink) ~= "function" then
+					return nil,"Need a data sink function."
+				end
+				if strt and (type(strt) ~= "number" or strt%1 ~= 0) then
+					return nil,"Invalid start byte position."
+				end
+				if stp and (type(stp) ~= "number" or stp%1 ~= 0) then
+					return nil,"Invalid stop byte position."
+				end
+				if strt and stp and stp < strt then
+					return nil,"Stop position should be equal or larger that start position"
+				end
+				local range
+				if strt or stp then
+					range = "Range: bytes="
+					if strt then
+						range = range..tostring(strt)
+					end
+					range = range.."-"
+					if stp then
+						range = range..tostring(stp)
+					end
+				end
+				local self = objData[t].gdrive
+				-- Get the download URL
+				local data,code = t:getProperty("downloadUrl")
+				if not data then
+					return nil,"Error getting download URL: "..code
+				end
+				data, code = self.oauth2:request(data, nil, {range})
+				if code < 200 or code > 206 then 
+					--print(content)
+					return nil,"Error downloading: "..formatHttpCodeError(code)
+				end
+				return pcall(sink,data)
 			end
 		},
 		__newindex = function(t,k,v)
@@ -395,67 +704,6 @@ local function validateConfig(config)
 	return true
 end
 
-local function generateBoundary()
-	math.randomseed(os.time())
-	local rnd = function() return string.sub(math.random(), 3) end
-	local result = {}
-	for i = 1,5 do table.insert(result, rnd()) end
-	return table.concat(result)
-end
-
-local function buildMultipartRelated(parts)
-	local boundary = generateBoundary()
-	local result = {}
-	for _,part in pairs(parts) do
-		-- delimiter
-		table.insert(result, '--' .. boundary)
-		-- encapsulation
-		table.insert(result, '\r\n')
-		table.insert(result, 'Content-Type: ' .. part.type .. '\r\n')
-		table.insert(result, '\r\n')
-		table.insert(result, part.data)
-		table.insert(result, '\r\n')
-	end
-	-- close-delimiter
-	table.insert(result, '--' .. boundary .. '--' .. '\r\n')
-	return table.concat(result), 'multipart/related; boundary=' .. boundary
-end
-
-local function insert(self, params, file)
-	local url = buildUrl(self,params)		-- Returns the parsed URL in a table
-	return request(self, url, json.encode(file), {'Content-Type: application/json'})
-end
-
-local function download(self,params, fileId)
-	local url = buildUrl(self,params, self.config.endpoint .. 'files/' .. fileId)
-	local data = request(self,url)
-	local content, code = self.oauth2:request(data.downloadUrl)
-	if code ~= 200 then 
-		return nil,"Could not fetch data: "..formatHttpCodeError(code)
-	end
-	return content, data
-end
-
-local function upload(self,params, file, blob)
-	local url = buildUrl(self,params, self.config.endpoint_upload .. 'files')
-	url.query.uploadType = 'multipart'
-	local data = {
-		{data = json.encode(file), type = 'application/json'},
-		{data = blob, type = file.mimeType},
-	}
-	local content, contentType = buildMultipartRelated(data)
-	return request(self, url, content, {'Content-Type: ' .. contentType})
-end
-
-local function delete(self,params, fileId)
-	local url = buildUrl(self,params, self.config.endpoint .. 'files/' .. fileId)
-	local _, code = self.oauth2:request(url, nil, nil, 'DELETE')
-	if code ~= 204 then 
-		return nil,"Error deleteing: "..formatHttpCodeError(code)
-	end
-	return true
-end
-
 -- Function to check whether a particular item exists
 -- name is the name of the item with the full path of the item from the root
 -- typ is the type of item. Valid values are 'folder' or 'file'. Default is 'file'
@@ -483,61 +731,35 @@ local function item(self,name,typ)
 	-- Separate the path and the last item
 	local namePre,itm = name:match("^(.*)%/(.-)$")
 	local parentID = "root"
-	local itemData
-	local stat,msg,ret
+	local stat,msg
 	-- Now iterate through the path
 	for level in namePre:gmatch("%/([^%/]+)") do
-		-- Get the parent directory list (children.list API)
-		stat,msg = list(self,{},self.config.endpoint.."files/"..parentID.."/children")
+		-- See if this item is there in the parent folder
+		stat,msg = list(self,{q="'"..parentID.."' in parents and title = '"..level.."' and mimeType = '"..self.mimeType.folder.."'"})
 		if not stat then
 			return nil,"Cannot get directory listing: "..msg
 		end
-		-- Now loop through each item to search for the level folder
-		local found 
-		for i = 1,#stat.items do
-			-- Get the file information
-			ret,msg = get(self,{q = "title = '"..level.."' and mimeType = '"..self.mimeType.folder.."'"},stat.items[i].id)
-			if not ret then 
-				return nil,"Cannot get file information: "..msg
-			end
-			if ret.mimeType == self.mimeType.folder then
-				-- Found the folder
-				found = i
-				break
-			end			
-		end		-- for i = 1,#stat.items do ends here
-		if not found then
+		if not stat.items[1] then
 			return false	-- Since this level folder does not exist, item cannot exist
 		end
-		parentID = stat.items[found].id
+		parentID = stat.items[1].id
 	end
 	
-	-- Now get the last directory listing where the item is supposed to be
-	stat,msg = list(self,{},self.config.endpoint.."files/"..parentID.."/children")
+	-- Now check the last directory for the item 
+	local compareSign
+	if typ == "folder" then
+		compareSign = "="
+	else
+		compareSign = "!="
+	end
+	stat,msg = list(self,{q="'"..parentID.."' in parents and title = '"..itm.."' and mimeType "..compareSign.." '"..self.mimeType.folder.."'"})
 	if not stat then
 		return nil,"Cannot get directory listing: "..msg
 	end
-	-- Now loop through each item to search for the item
-	local found 
-	for i = 1,#stat.items do
-		-- Get the file information
-		ret,msg = get(self,{q = "title = '"..itm.."'"},stat.items[i].id)
-		if not ret then 
-			return nil,"Cannot get file information: "..msg
-		end
-		--print(ret.title,ret.mimeType)
-		print(ret.nextPageToken)
-		if (typ == "folder" and ret.mimeType == self.mimeType.folder) or (typ == "file" and ret.mimeType ~= self.mimeType.folder) then
-			-- Found the folder
-			found = i
-			itemData = ret
-			break
-		end			
-	end		-- for i = 1,#stat.items do ends here
-	if not found then
+	if not stat.items[1] then
 		return false	-- Since this level folder does not exist, item cannot exist
 	end
-	return createObject(self,itemData,namePre.."/")
+	return createObject(self,stat.items[1],namePre.."/")
 end
 
 -- Function to make a directory given the string directory name
@@ -560,43 +782,25 @@ local function mkdir(self,dir)
 		dir = [[/]]..dir
 	end
 	local parentID = "root"
-	local itemData
-	local stat,msg,ret
+	local stat,msg, itemData
 	-- Now iterate through the path
 	for level in dir:gmatch("%/([^%/]+)") do
-		-- Get the parent directory list (children.list API) with the query parameter of title matching level
-		stat,msg = list(self,{q = "title = '"..level.."' and mimeType = '"..self.mimeType.folder.."'"},self.config.endpoint.."files/"..parentID.."/children")
-		print(stat)
+		-- Check whether level folder exists under this parent
+		stat,msg = list(self,{q="'"..parentID.."' in parents and title = '"..level.."' and mimeType = '"..self.mimeType.folder.."'"})
 		if not stat then
 			return nil,"Cannot get directory listing: "..msg
 		end
-		-- Now loop through each item to search for the level folder
-		local found 
-		for i = 1,#stat.items do
-			-- Get the file information
-			ret,msg = get(self,{},stat.items[i].id)
-			if not ret then 
-				return nil,"Cannot get file information: "..msg
-			end
-			if ret.title == level and ret.mimeType == self.mimeType.folder then
-				-- Found the folder
-				found = i
-				itemData = ret
-				break
-			end			
-		end		-- for i = 1,#stat.items do ends here
-		if not found then
+		if not stat.items[1] then
 			-- Create the folder here
-			local file = {title = level, mimeType = self.mimeType.folder,parents={{id=parentID}}}
-			local url = buildUrl(self,{})		-- Returns the parsed URL in a table
-			local folder,msg = request(self, url, json.encode(file), {'Content-Type: application/json'})	
+			local folder, msg = insert(self,{},{title = level, mimeType = self.mimeType.folder,parents={{id=parentID}}})
 			if not folder then
 				return nil,"Could not create folder: "..msg
 			end
 			itemData = folder
 			parentID = folder.id
 		else
-			parentID = stat.items[found].id
+			itemData = stat.items[1]
+			parentID = stat.items[1].id
 		end
 	end		-- for level in dir:gmatch("%/([^%/]+)") do ends
 	return createObject(self,itemData,dir:match("^(.*%/).-$"))
@@ -611,7 +815,6 @@ function new(config)
 		mimeType = mimeType,
 		mkdir = mkdir,
 		item = item,
-		get = get
 	}
 	setmetatable(obj,identifier)	-- To validate teh Google Drive connection object
 	-- Create the object configuration
