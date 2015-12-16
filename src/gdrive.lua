@@ -31,7 +31,6 @@ local baseConfig = {
 	endpoint = 'https://www.googleapis.com/drive/v2/',
 	endpoint_upload = 'https://www.googleapis.com/upload/drive/v2/',
 	approval_prompt = 'force',
-	curl_options = {ssl_verifypeer = 0},
 	access_type = 'offline',
 }
 
@@ -209,10 +208,10 @@ setmetatable(idToObj,idToObjMeta)
 local objItems = {
 	'id',		-- Required (code depends on it)
 	'mimeType',	-- Required (code depends on it)
-	'title',	
+	'title',	-- Required (code depends on it)
 	-- Other items stored:
 --	gdrive,		-- Google drive connection object (code depends on it)
--- 	path		-- Path of the item
+-- 	path		-- Path of the item (code depends on it)
 }
 
 local function copyTable(source, target)
@@ -229,7 +228,7 @@ local function request(self, url, payload, headers, verb, options)
 	local content, code = self.oauth2:request(url, payload, headers, verb, options)
 	if code < 200 or code > 206 then 
 		--print(content)
-		return nil,formatHttpCodeError(code)
+		return nil,formatHttpCodeError(code),content
 	end
 	return json.decode(content) or ""
 end
@@ -259,7 +258,7 @@ end
 -- verb is the http method like "GET", "POST", "PUT". Since there is a body the default verb is "POST"
 local function insert(self, params, body, endpoint, verb)
 	local url = buildUrl(self,params,endpoint)		-- Returns the parsed URL in a table
-	return request(self, url, json.encode(body), {'Content-Type: application/json'}, verb)
+	return request(self, url, json.encode(body), {["Content-Type"] = "application/json"}, verb)
 end
 
 local objMeta, createObject
@@ -294,12 +293,12 @@ do
 	
 	function nextListPage(dirList)
 		if not dirList.nextPageToken or not dirList.items or not dirList.items[1] or not objData[dirList.items[1]] or not dirList.parentID then
-			return nil
+			return nil, "Invalid directory listing object."
 		end
 		local self = objData[dirList.items[1]].gdrive
-		local stat,msg = list(self,{pageToken = dirList.nextPageToken, maxResults = dirList.num,q="'"..dirList.parentID.."' in parents"})
+		local stat,msg,msg2 = list(self,{pageToken = dirList.nextPageToken, maxResults = dirList.num,q="'"..dirList.parentID.."' in parents"})
 		if not stat then 
-			return nil,"Cannot get folder listing: "..msg
+			return nil,"Cannot get folder listing: "..msg,msg2
 		end
 		-- Create the directory listing object
 		local nextList = {
@@ -352,9 +351,9 @@ do
 				end
 				num = num or 100
 				local self = objData[t].gdrive
-				local stat,msg = list(self,{maxResults=num,q="'"..objData[t].id.."' in parents"})
+				local stat,msg,msg2 = list(self,{maxResults=num,q="'"..objData[t].id.."' in parents"})
 				if not stat then 
-					return nil,"Cannot get folder listing: "..msg
+					return nil,"Cannot get folder listing: "..msg,msg2
 				end
 				-- Create the directory listing object
 				local dirList = {
@@ -370,7 +369,7 @@ do
 				return dirList
 			end,
 			-- function to check whether an item exists
-			-- name is the name of the item with the full path of the item from the root
+			-- name is the name of the item in this folder
 			-- typ is the type of item. Valid values are 'folder' or 'file'. Default is 'file'
 			-- Returns nil, Error message in case of error or failure
 			-- Returns item object if it exits
@@ -380,7 +379,7 @@ do
 					return nil,"Object not valid or not a folder"
 				end
 				if not name or type(name) ~= "string" then
-					return nil, "Need a valid string directory name"
+					return nil, "Need a valid string name"
 				end
 				typ = typ or "file"
 				if type(typ) ~= "string" or (typ:lower() ~= "folder" and typ:lower() ~= "file") then
@@ -479,7 +478,7 @@ do
 				}
 				local content, contentType = buildMultipartRelated(data)
 				local url = buildUrl(self,{uploadType = 'multipart'}, self.config.endpoint_upload .. 'files')
-				local item,msg = request(self, url, content, {'Content-Type: ' .. contentType})
+				local item,msg = request(self, url, content, {["Content-Type"] = contentType})
 				if not item then
 					return nil, "Error uploading file: "..msg
 				end
@@ -554,7 +553,7 @@ do
 					typ = "folder"
 				end
 				local self = objData[t].gdrive
-				local item = self:item(objData[t].path..newName,typ)
+				local item = t:item(newName,typ)
 				if item then
 					-- It already exists
 					if not force then
@@ -636,7 +635,7 @@ do
 				end
 				local range
 				if strt or stp then
-					range = "Range: bytes="
+					range = "bytes="
 					if strt then
 						range = range..tostring(strt)
 					end
@@ -651,10 +650,10 @@ do
 				if not data then
 					return nil,"Error getting download URL: "..code
 				end
-				data, code = self.oauth2:request(data, nil, {range})
+				data, code = self.oauth2:request(data, nil, {Range=range})
 				if code < 200 or code > 206 then 
 					--print(content)
-					return nil,"Error downloading: "..formatHttpCodeError(code)
+					return nil,"Error downloading: "..formatHttpCodeError(code),data
 				end
 				return pcall(sink,data)
 			end
@@ -714,6 +713,9 @@ local function item(self,name,typ)
 	if getmetatable(self) ~= identifier then
 		return nil, "Invalid gdrive object"
 	end
+	if not self.oauth2.tokens then
+		return nil,"Access token not acquired. Information in amazondrive.acquireToken."
+	end
 	if not name or type(name) ~= "string" then
 		return nil, "Need a valid string directory name"
 	end
@@ -771,6 +773,9 @@ end
 local function mkdir(self,dir)
 	if getmetatable(self) ~= identifier then
 		return nil, "Invalid gdrive object"
+	end
+	if not self.oauth2.tokens then
+		return nil,"Access token not acquired. Information in gdrive.acquireToken."
 	end
 	if not dir or type(dir) ~= "string" then
 		return nil, "Need a valid string directory name"
@@ -832,14 +837,28 @@ function new(config)
 	end
 	if not obj.oauth2.tokens then
 		stat = obj.oauth2:acquireToken()
-		obj.acquireToken = stat	-- The application using this module will have to aquire the token and call the included function to add the token
+		-- The application using this module will have to acquire the token and call the included function to add the token
+		obj.acquireToken = {stat[1], function(code)		-- Wrapper to the function passed by the oauth2 module to get the root element as well
+			local ret,msg,content = stat[2](code)
+			if not ret then
+				return nil,msg,content
+			end
+			ret,msg = get(obj,{},"root")
+			if not ret then
+				return nil,"Cannot get the root directory information: "..msg
+			end
+			obj.root = createObject(obj,ret,"")
+			objData[obj.root].title = ""	-- Make the title an empty string so that it does not get added to the paths of subsequent levels			
+			return true
+		end}
+	else
+		stat,msg = get(obj,{},"root")
+		if not stat then
+			return nil,"Cannot get the root directory information: "..msg
+		end
+		obj.root = createObject(obj,stat,"")
+		objData[obj.root].title = ""	-- Make the title an empty string so that it does not get added to the paths of subsequent levels
 	end
-	stat,msg = get(obj,{},"root")
-	if not stat then
-		return nil,"Cannot get the root directory information: "..msg
-	end
-	obj.root = createObject(obj,stat,"")
-	objData[obj.root].title = ""	-- Make the title an empty string so that it does not get added to the paths of subsequent levels
  	return obj
 end
 

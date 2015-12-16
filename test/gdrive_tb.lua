@@ -60,9 +60,10 @@ work = function()
 	local stat
 	if ACQUIRE_TOKEN then
 		print('Acquire Token')
-		stat = gdrive.oauth2:acquireToken()
+		stat = gdrive.acquireToken
+	else
+		stat = true
 	end
-	stat = true
 	local code,msg
 	if stat then
 		if ACQUIRE_TOKEN then
