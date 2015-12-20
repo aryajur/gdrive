@@ -553,7 +553,7 @@ do
 					typ = "folder"
 				end
 				local self = objData[t].gdrive
-				local item = t:item(newName,typ)
+				local item = self:item(objData[t].path..newName,typ)	-- Cannot use t:item since t may be a file
 				if item then
 					-- It already exists
 					if not force then
@@ -852,6 +852,7 @@ function new(config)
 			return true
 		end}
 	else
+		obj.acquireToken = obj.oauth2:acquireToken()
 		stat,msg = get(obj,{},"root")
 		if not stat then
 			return nil,"Cannot get the root directory information: "..msg
