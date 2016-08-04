@@ -1,3 +1,27 @@
+--[[
+The MIT License (MIT)
+
+Copyright (c) 2016 Milind Gupta
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+]]
+
 -- Google Drive access module for Lua 5.2+
 local url = require 'net.url'
 local json = require 'json'
@@ -22,7 +46,7 @@ local M = {}
 package.loaded[...] = M
 _ENV = M		-- Lua 5.2+
 
-_VERSION = "1.15.12.07"
+_VERSION = "1.16.06.16"
 
 local baseConfig = {
 	auth_url = 'https://accounts.google.com/o/oauth2/auth',
@@ -205,6 +229,7 @@ setmetatable(idToObj,idToObjMeta)
     string
   ]
 }]]
+-- objItems is used as a template to decide which properties to store of the object in the objData table
 local objItems = {
 	'id',		-- Required (code depends on it)
 	'mimeType',	-- Required (code depends on it)
@@ -225,7 +250,8 @@ local function formatHttpCodeError(x)
 end
 
 local function request(self, url, payload, headers, verb, options)
-	local content, code = self.oauth2:request(url, payload, headers, verb, options)
+	local content, code, tokenUpdated = self.oauth2:request(url, payload, headers, verb, options)
+	self.tokenUpdated = self.tokenUpdated or tokenUpdated
 	if code < 200 or code > 206 then 
 		--print(content)
 		return nil,formatHttpCodeError(code),content
@@ -537,6 +563,7 @@ do
 					return nil,msg
 				end
 			end,
+			-- Function to rename an item to a new name
 			rename = function(t,newName,force)
 				if not objData[t] then
 					return nil, "Invalid item object"
@@ -568,6 +595,7 @@ do
 				end
 				return t:setProperty("title",newName)
 			end,
+			
 			copyto = function(t,dest,force)
 				if not objData[dest] or objData[dest].mimeType ~= mimeType.folder then
 					return nil,"Invalid destination object."
@@ -604,6 +632,7 @@ do
 					return nil,"Error copying: "..msg
 				end
 			end,
+			-- Function to delete an item from the Google Drive
 			delete = function(t)
 				if not objData[t] then
 					return nil, "Invalid item object"
@@ -650,7 +679,9 @@ do
 				if not data then
 					return nil,"Error getting download URL: "..code
 				end
-				data, code = self.oauth2:request(data, nil, {Range=range})
+				local tokenUpdated
+				data, code, tokenUpdated = self.oauth2:request(data, nil, {Range=range})
+				self.tokenUpdated = self.tokenUpdated or tokenUpdated
 				if code < 200 or code > 206 then 
 					--print(content)
 					return nil,"Error downloading: "..formatHttpCodeError(code),data
@@ -689,7 +720,7 @@ function createObject(gdrive,itemData,path)
 	t.path = path
 	setmetatable(obj,objMeta)
 	idToObj[itemData.id] = obj
-	objData[obj] = t
+	objData[obj] = t	-- all cached data stored here for the item object
 	return obj
 end
 
@@ -820,6 +851,10 @@ function new(config)
 		mimeType = mimeType,
 		mkdir = mkdir,
 		item = item,
+		tokenUpdated = false,
+		root = nil,
+		oauth2 = nil,
+		acquireToken = nil
 	}
 	setmetatable(obj,identifier)	-- To validate teh Google Drive connection object
 	-- Create the object configuration
@@ -852,6 +887,7 @@ function new(config)
 			return true
 		end}
 	else
+		-- Tokens are already there so place the acquireToken result in acquireToken and get the root listing
 		obj.acquireToken = obj.oauth2:acquireToken()
 		stat,msg = get(obj,{},"root")
 		if not stat then
